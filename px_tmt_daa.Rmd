@@ -1,0 +1,629 @@
+---
+title: "Proteomics (TMT) Differential Abundance Analysis"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    code_download: yes
+    code_folding: hide
+    number_sections: no
+    theme: lumen
+    toc: yes
+    toc_collapsed: yes
+    toc_depth: 3
+    toc_float: yes
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      warning = F,
+                      message = F)
+
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(limma)
+library(arrow)
+library(readr)
+library(QFeatures)
+library(dreamerr)
+library(yaml,warn.conflicts = FALSE)
+
+```
+
+## Introduction
+
+This Rmd describes our differential abundance analysis (DAA) workflow for proteomics TMT data.
+
+Prior to the DAA the .raw data was processed with Proteome Discoverer.
+
+The starting point for the analysis with this .Rmd are PSM level TMT channel intensities reported by Proteome Discoverer.
+
+## Params
+
+```{r}
+INPUT_FILES <- read_yaml('config.yaml')
+```
+
+## Read data
+
+```{r,read_data}
+
+samples_df <- readr::read_tsv(INPUT_FILES$samples_file) %>%
+  janitor::clean_names() %>%
+  dplyr::rename(sample_name = sample) %>%
+  mutate(sample_name = stringr::str_replace_all(sample_name,'\\+','_'),
+         condition = stringr::str_replace_all(condition,'\\+','_')
+         )
+contrasts_df <- readr::read_tsv(INPUT_FILES$contrasts_file) %>%
+  janitor::clean_names() %>%
+  mutate(contrast = stringr::str_replace_all(contrast,'\\+','_'),
+         contrast = stringr::str_replace_all(contrast,'vs','-')
+         )
+
+# abund
+abund_df <- arrow::read_parquet(INPUT_FILES$qprot_abund_file)%>%  
+  mutate_if(function(x){class(x)=="integer64"},
+              as.integer) %>%
+  janitor::clean_names() %>%
+  mutate(sample_name = stringr::str_replace_all(sample_name,'-','_'),
+         condition = stringr::str_replace_all(condition,'-','_')
+         )%>%
+  mutate(sample_name = stringr::str_replace_all(sample_name,'\\+','_'),
+         condition = stringr::str_replace_all(condition,'\\+','_')
+         )
+
+# quan
+quan_df <- arrow::read_parquet(INPUT_FILES$qprot_quan_file)%>%   
+  mutate_if(function(x){class(x)=="integer64"},
+              as.integer) %>%
+  janitor::clean_names() %>%
+  dplyr::rename(contrast = sample_name) %>%
+  mutate(contrast = stringr::str_replace_all(contrast,'\\+','_'),
+         contrast = stringr::str_replace_all(contrast,'vs','-')
+         )
+
+
+df <- arrow::read_parquet(INPUT_FILES$qpsms_abund_file) %>%
+  bind_cols(select(.$peptide_info_json,-unique_pep)) %>%
+  select(-peptide_info_json) %>%
+  janitor::clean_names() %>%
+  mutate(master_accession = stringr::str_remove(master_accession,';.*'),
+         sample_name = stringr::str_replace_all(sample_name,'\\+','_')
+         ) %>%
+ left_join(
+    abund_df %>% distinct(master_accession,
+                          gene_name,
+                          master_description,
+                          contaminant),
+      by = 'master_accession'
+
+  ) 
+```
+
+### create QFeatures obj
+
+```{r, create_qfeatures_obj}
+
+col_data <- samples_df %>% 
+              distinct(sample_name,condition,
+                       sample_sm_fid,
+                       channel,
+                       nominator,
+                       denominator,
+                       condition,
+                       replicate
+                       ) %>% 
+              tibble::column_to_rownames(var = 'sample_name')
+
+
+row_id <- 'id'
+row_data_cols <- c(row_id,
+                 'sequence','quan_info', 
+                 'master_accession','master_accessions','gene_name',  
+                 'master_description',
+                 'contaminant',
+                 'percolator_pep','redun',
+                 'source',
+                 'weight',
+                 'sps_mass_matches',
+                 'percent_isolation_interference',
+                 'average_reporter_sn'
+                 #'protein_accessions','parent_protein_accessions','parent_protein_group_count'
+                 )
+
+wide_df <- df %>%
+  dplyr::select(all_of(row_data_cols),'abund','sample_name')%>%
+  tidyr::pivot_wider(names_from = c('sample_name'),
+                     values_from = 'abund'
+) %>%
+  group_by(master_accession) %>%
+  mutate(n_psms = n(),
+         n_pep = n_distinct(sequence),
+         n_uni_pep = n_distinct(sequence[redun == 1]),
+         ) %>%
+  ungroup
+
+
+
+se <- wide_df %>% 
+  {readSummarizedExperiment(.,
+                            ecol = names(.) %in% rownames(col_data),
+                            fnames = row_id
+  )}
+
+# add additional exp design columns
+colData(se)$sample_name <- colnames(se)
+colData(se)$condition <-
+  as.vector(set_names(col_data$condition,rownames(col_data))[rownames(colData(se))])
+colData(se)$channel <-
+  as.vector(set_names(col_data$channel,rownames(col_data))[rownames(colData(se))])
+colData(se)$nominator <-
+  as.vector(set_names(col_data$nominator,rownames(col_data))[rownames(colData(se))])
+colData(se)$denominator <-
+  as.vector(set_names(col_data$denominator,rownames(col_data))[rownames(colData(se))])
+colData(se)$replicate_nb <-
+  as.vector(set_names(col_data$replicate,rownames(col_data))[rownames(colData(se))])
+
+qf <- QFeatures(list(psms = se))
+  colData(qf) <- colData(se)
+
+qf %<>% zeroIsNA(i= 'psms')  
+  
+```
+
+## PSM quantities -\> Protein -\> Quantities
+
+### filter
+
+-   keep protein specific peptides (redun == 1)
+-   keep psms assigned *quan_info* status *'passed'* ;
+    -   sps_mass_matches \>= 60%
+    -   percent_isolation_interference \<= 50%
+    -   average_reporter_sn \>= 10
+    -   no missing values (i.e. psms with missing reporter ion signals are discarded)
+
+```{r, filter}
+# reset qf
+kept_assays <- c("psms")
+qf <- removeAssay(qf,i = setdiff(names(qf),kept_assays))
+
+qf <- addAssay(qf,SummarizedExperiment::subset(qf[['psms']],
+                                      redun == 1 & quan_info == 'passed'),
+         name = 'qpsms',
+         assayLinks = 
+                    AssayLinks(AssayLink('qpsms',
+                                         from = 'psms'))
+         )
+qf <- QFeatures::addAssayLink(qf,
+                                  from = 'psms',
+                                  to = 'qpsms',
+                                  varFrom = 'id',
+                                  varTo = 'id'
+)
+
+# add q_psm & q_uni_pep to raw data
+rowData(qf[['qpsms']]) %<>%
+  as.data.frame() %>%
+  group_by(master_accession) %>%
+  mutate( q_psm = n(),
+          q_uni_pep = n_distinct(sequence)
+         ) %>%
+  ungroup %>%
+  DataFrame()
+
+
+```
+
+### mean center reporter ion quantities per sample
+
+```{r, psm_mean_center}
+# reset qf
+kept_assays <- c("psms","qpsms")
+qf <- removeAssay(qf,i = setdiff(names(qf),kept_assays))
+
+# sample mean center 
+qf <- normalize(qf, i = "qpsms",
+                   name = "qpsms_norm",
+                   method = "div.mean")
+```
+
+### protein roll-up
+
+```{r, aggregate }
+# reset qf
+kept_assays <- c("psms","qpsms",'qpsms_norm')
+qf <- removeAssay(qf,i = setdiff(names(qf),kept_assays))
+
+
+qf <-
+    aggregateFeatures(qf,
+                      "qpsms_norm",
+                       name = "proteins",
+                       fcol = "master_accession",
+                       fun = base::colMeans,
+                       na.rm = TRUE)
+```
+
+### Calculate protein log ratios
+
+```{r, ratio_transform_fcns}
+ratio_transform <- function(qf,
+                            i='eg',
+                            name = 'eg_ratio',
+                            is_log_scale=F,
+                            use_group_design = F,
+                            ...
+){
+
+  check_value(qf,'class(QFeatures)')
+  check_arg(.x1=i,
+            .x2 = name,
+            .type = "character scalar")
+  check_arg(.x1=is_log_scale,
+            .x2 = use_group_design,
+            .type = "logical scalar")
+
+  # no groups -> sweep mean
+  if(!use_group_design){
+    if(is_log_scale){
+      qf <- QFeatures::sweep(qf,i = i,name = name,MARGIN=1,
+                  STATS =log2(rowMeans(2^assay(qf[[i]]), na.rm=T)),
+                  FUN = "-"
+      )
+    }else{
+      qf <- QFeatures::sweep(qf,i = i,name = name,MARGIN=1,
+                  STATS =rowMeans(assay(qf[[i]]), na.rm=T),
+                  FUN = "/"
+      )
+    }
+  }else{
+    if(all(c('nominator','denominator') %in% names(colData(qf)))){
+      .ratio_transform_grouped_design(qf,i=i,name=name,
+                                      is_log_scale = is_log_scale,
+                                      ...)
+    }else{
+      stop("missing colData columns 'nominator','denominator'")
+    }
+  }
+}
+
+.ratio_transform_grouped_design <- function(qf,
+                                            i ='eg',
+                                            name = 'eg_ratio',
+                                            is_log_scale=F,
+                                            suppress_messages = T,
+                                            suppress_warnings = T
+){
+
+  check_value(qf,'class(QFeatures)')
+  check_arg(.x1=i,
+            .x2 = name,
+            .type = "character scalar")
+  check_arg(.x1=is_log_scale,
+            .x2 = suppress_messages,
+            .x3 = suppress_warnings,
+            .type = "logical scalar")
+
+  # wide to long to wide
+  m <- longFormat(qf[,,i],
+                  colvars = c('sample_name','condition',
+                              'nominator','denominator')) %>%
+    as.data.frame() %>%
+    {
+      if(is_log_scale) mutate(group_by(.,rowname,nominator),
+                              ratio = value - log2(mean(2^value[denominator > 0],
+                                                        na.rm=T))
+      )
+      else mutate(group_by(.,rowname,nominator),
+                  ratio = value / mean(value[denominator > 0], na.rm=T)
+      )
+    } %>%
+    `if`(suppress_messages,suppressMessages(.),.) %>%
+    `if`(suppress_warnings,suppressWarnings(.),.)
+
+  m %<>%
+    tidyr::pivot_wider(id_cols = c('rowname'),
+                names_from = 'sample_name',
+                values_from = 'ratio') %>%
+    ungroup() %>%
+    tibble::column_to_rownames() %>%
+    as.matrix()
+
+  m <- m[match(rownames(m),rownames(rowData(qf[[i]]))) ,
+         match(colnames(m),rownames(colData(qf)))]
+  se <- SummarizedExperiment(m,
+                             colData =  colData(qf[[i]]),
+                             rowData =  rowData(qf[[i]])
+  )
+  qf <- addAssay(qf,se,
+                 name = name,
+                 assayLinks =
+                   AssayLinks(AssayLink(name,
+                                        from = i)
+                   ))
+
+  # if se isn't empty
+  if(nrow(se) > 0){
+    qf <- QFeatures::addAssayLinkOneToOne(qf,
+                                  from = i,
+                                  to = name)
+  }
+
+  return(qf)
+
+}
+
+```
+
+```{r, normalise}
+# reset qf
+kept_assays <- c("psms","qpsms",'qpsms_norm','proteins')
+qf <- removeAssay(qf,i = setdiff(names(qf),kept_assays))
+
+# log transform
+qf <- logTransform(qf, i = "proteins",
+                      name = "log_proteins")
+
+use_group_design <- 'nominator' %in% names(colData(qf)) &
+    'denominator' %in% names(colData(qf))
+qf <- ratio_transform(qf,
+                        i="log_proteins",
+                        name="l2r_proteins",
+                        is_log_scale=T,
+                        use_group_design = use_group_design
+)
+
+
+```
+
+### Median center protein log ratios
+
+```{r}
+
+# reset qf
+kept_assays <- c("psms","qpsms",'qpsms_norm','proteins',
+                 'log_proteins',"l2r_proteins"
+                 )
+qf <- removeAssay(qf,i = setdiff(names(qf),kept_assays))
+
+# sample median center 
+qf <- normalize(qf, i = "l2r_proteins",
+                   name = "m_l2r_proteins",
+                   method = "center.median")
+
+```
+
+### Overview of data processing steps
+
+```{r, plot_qf}
+plot(qf)
+```
+
+## Differential Abundance Analysis
+
+```{r, daa_fcn}
+daa <- function(qf,i='l2r_proteins',
+                exp_design_df = NA,
+                lm_formula = as.formula('~-1+condition'),
+                contrasts = NA
+                ){
+  
+  prots <- qf[[i]]
+  
+  design <- stats::model.matrix(lm_formula, data=exp_design_df )
+  colnames(design) %<>% stringr::str_remove(pattern = "^condition")
+  fit <- lmFit(assay(prots), design)
+  
+  contrast_matrix <- limma::makeContrasts(contrasts=contrasts,levels=design)
+  # calculate contrast coefficients
+  fit_contrasts <- limma::contrasts.fit(fit,contrast_matrix)
+  fit_ebayes <- limma::eBayes(fit_contrasts)
+  
+  quan_idx_col <- 'master_accession'
+  # summarise in long format
+  protein_quan_df <-
+      fit_ebayes$coefficients %>%
+      tibble::as_tibble(rownames =NA) %>%
+      tibble::rownames_to_column(var = quan_idx_col) %>%
+      tidyr::pivot_longer(!all_of(quan_idx_col),
+                          names_to = "contrast",
+                          values_to = "l2fc") %>%
+      left_join(
+        fit_ebayes$p.value %>%
+          tibble::as_tibble(rownames =NA) %>%
+          tibble::rownames_to_column(var = quan_idx_col) %>%
+          tidyr::pivot_longer(!all_of(quan_idx_col),
+                              names_to = "contrast",
+                              values_to = "pval"),
+        by = c(quan_idx_col,'contrast')
+    ) %>%
+    left_join(
+      rowData(qf[[i]]) %>%
+      as_tibble() %>%
+      select(master_accession,gene_name,master_description,
+             contaminant,
+             q_psm,q_uni_pep,
+             n_psms,n_uni_pep),
+      by= 'master_accession'
+    ) 
+  
+  return(protein_quan_df)
+  
+}
+```
+
+```{r, daa}
+
+exp_design_df<- colData(qf) %>% 
+                as.data.frame() 
+
+contrasts <- unique(contrasts_df$contrast)
+
+protein_quan_df <- 
+    daa(qf,
+      i = 'm_l2r_proteins',
+      exp_design_df = exp_design_df,
+      lm_formula = as.formula('~-1+condition'),
+      contrasts = contrasts
+    )
+ 
+
+```
+
+## Results
+
+### Volcanoes
+
+```{r, volcanoes, warning=FALSE}
+
+for(c in contrasts){
+  
+  p <- protein_quan_df %>%
+    dplyr::filter(contrast %in% !!c) %>%
+    ggplot2::ggplot(ggplot2::aes(x= l2fc, y = -log10(pval))) +
+    ggplot2::geom_point()  +
+    #ggplot2::geom_hline(yintercept = 2, linetype = 'dashed')+
+    #ggplot2::ggtitle(c)+
+    ggplot2::theme_bw()
+  
+  plot(p)
+}
+
+```
+
+## Export
+
+```{r, export, eval =F}
+readr::write_tsv(protein_quan_df,file = paste0(tempdir(),'/protein_daa.tsv'))
+```
+
+## Check
+
+The data was originally processed by an in-house pipeline (*org_pipline*). Here we confirm that this .Rmd generates identical results.
+
+### protein stats
+
+```{r}
+rowData(qf[['proteins']]) %>%
+          as_tibble() %>%
+  left_join(
+    abund_df %>%
+      dplyr::rename(n_psms = n_ps_ms) %>%
+      distinct(master_accession,
+               q_psm,
+               n_psms,
+               n_pep,
+               n_uni_pep,
+               q_uni_pep),
+    suffix = c('_qf','_org_pipeline'),
+    by = 'master_accession'
+  ) %>%
+  #mutate(check_q_psm =  ) %>%
+  summarise(all(q_psm_org_pipeline == q_psm_qf),
+            all(n_psms_org_pipeline == n_psms_qf),
+            all(n_pep_org_pipeline == n_pep_qf),
+            all(n_uni_pep_org_pipeline == n_uni_pep_qf),
+            all(q_uni_pep_org_pipeline == q_uni_pep_qf)
+            ) %>%
+  all() %>%
+  testthat::expect_true()
+  
+```
+
+### abund
+
+```{r, check_abund}
+
+longFormat(qf[,,'proteins'],
+                        colvars = c('condition'),
+                        rowvars = 'master_accession'
+                        ) %>%
+  as.data.frame() %>%
+  dplyr::rename(sample_name = colname,
+         abund = value) %>%
+  select('sample_name','master_accession', 'abund') %>%
+  left_join(
+    abund_df,
+    suffix = c('_qf','_org_pipeline'),
+    by = c('sample_name','master_accession')
+  ) %>%
+  select(master_accession,sample_name,abund_org_pipeline,abund_qf) %>%
+  # mutate(abund_org = signif(abund_org,4),
+  #        abund_qf = signif(abund_qf,4)
+  #        ) %>%
+  # mutate(check = abund_org == abund_qf) %>%
+  sample_n(1000) %>%
+  ggplot(aes(x = log(abund_org_pipeline), y= log(abund_qf)))+
+  geom_point()
+```
+
+### m_l2r
+
+```{r, check_m_l2r}
+longFormat(qf[,,'m_l2r_proteins'],
+                        colvars = c('condition'),
+                        rowvars = 'master_accession'
+                        ) %>%
+  as.data.frame() %>%
+  dplyr::rename(sample_name = colname,
+         m_l2r = value) %>%
+  select('sample_name','master_accession', 'm_l2r') %>%
+  left_join(
+    abund_df,suffix = c('_qf','_org_pipeline'),
+    by = c('sample_name','master_accession')
+  ) %>%
+  select(master_accession,sample_name,m_l2r_org_pipeline,m_l2r_qf) %>%
+  # mutate(abund_org = signif(abund_org,4),
+  #        abund_qf = signif(abund_qf,4)
+  #        ) %>%
+  # mutate(check = abund_org == abund_qf) %>%
+  sample_n(1000) %>%
+  ggplot(aes(x = m_l2r_org_pipeline, y= m_l2r_qf))+
+  geom_point()
+
+# check qProts
+testthat::expect_equal(nrow(qf[['m_l2r_proteins']]),
+  filter(abund_df,!is.na(m_l2r))$master_accession %>% n_distinct())
+
+```
+
+### l2fc, pval
+
+```{r, check daa}
+comp_df <- protein_quan_df %>%
+  select(contrast,master_accession,pval,l2fc) %>%
+  left_join(
+    quan_df %>%
+      select(contrast,master_accession,pval,l2fc),
+    suffix = c('_qf','_org_pipeline'),
+    by = c('contrast','master_accession')
+  ) 
+
+comp_df %>%
+  #sample_n(5000) %>%
+  ggplot(aes(x = l2fc_org_pipeline, y= l2fc_qf))+
+  geom_point()
+
+comp_df %>%
+  sample_n(5000) %>%
+  ggplot(aes(x = pval_org_pipeline, y= pval_qf))+
+  geom_point()
+
+# check qProts
+testthat::expect_equal(filter(protein_quan_df,!is.na(pval))$master_accession %>% n_distinct(),
+  filter(quan_df,!is.na(pval))$master_accession %>% n_distinct())
+
+```
+
+## Session information
+
+```{r, eval=F}
+sessionInfo()
+```
