@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.10962720.svg)](https://doi.org/10.5281/zenodo.10962720)
+
 ## Synopsis
 
 This Rmd describes our differential abundance analysis (DAA) workflow for proteomics TMT data. Prior to the DAA the .raw data was processed with Proteome Discoverer. The starting point for the analysis with this .Rmd are PSM level TMT channel intensities reported by Proteome Discoverer.
